@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "eastus2"
+    },
+    "environment": {
+      "value": "dev"
+    },
+    "resourceGroupName": {
+      "value": "rg-terraform-state"
+    },
+    "stateContainers": {
+      "value": ["tfstate"]
+    },
+    "allowedIpRanges": {
+      "value": []
+    },
+    "allowedVnetSubnetIds": {
+      "value": []
+    },
+    "pipelineIdentityObjectId": {
+      "value": ""
+    },
+    "enableDefenderForStorage": {
+      "value": false
+    },
+    "enableResourceLock": {
+      "value": false
+    },
+    "logAnalyticsWorkspaceId": {
+      "value": ""
+    },
+    "blobSoftDeleteRetentionDays": {
+      "value": 30
+    },
+    "containerSoftDeleteRetentionDays": {
+      "value": 7
+    },
+    "tags": {
+      "value": {
+        "environment":         "dev",
+        "cost-center":         "infrastructure",
+        "owner":               "platform-team",
+        "data-classification": "internal",
+        "managed-by":          "arm-bootstrap",
+        "project":             "azure-enterprise-landing-zone"
+      }
+    }
+  }
+}

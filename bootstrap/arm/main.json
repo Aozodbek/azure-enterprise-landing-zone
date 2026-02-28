@@ -1,0 +1,502 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Bootstrap ARM template for Azure Enterprise Landing Zone Terraform state backend.",
+    "notes": [
+      "Subscription-scoped deployment — creates the resource group and all state resources.",
+      "Storage is hardened to enterprise standard: TLS 1.2, no public blob access, infrastructure",
+      "  encryption, blob versioning, soft delete, network ACLs.",
+      "Conditional resources: diagnostics, Defender for Storage, CanNotDelete lock,",
+      "  Storage Blob Data Contributor role assignment for CI/CD pipeline identity.",
+      "Single 'tfstate' container — environments are differentiated by blob key prefix:",
+      "  dev/terraform.tfstate, staging/terraform.tfstate, prod/terraform.tfstate.",
+      "Storage account named stterraformstate<8-char unique suffix> — matches backend.tf convention.",
+      "Run via deploy.sh or directly with az deployment sub create."
+    ]
+  },
+
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "eastus2",
+      "allowedValues": [
+        "eastus", "eastus2", "westus2", "westeurope", "northeurope",
+        "uksouth", "southeastasia", "australiaeast", "canadacentral"
+      ],
+      "metadata": {
+        "description": "Azure region. Defaults to eastus2 — matching var.location in variables.tf. Must match the landing zone region to minimise egress costs."
+      }
+    },
+
+    "environment": {
+      "type": "string",
+      "defaultValue": "dev",
+      "allowedValues": ["dev", "staging", "prod"],
+      "metadata": {
+        "description": "Target environment. Controls the blob key prefix written to backendConfig: {environment}/terraform.tfstate. Must match var.environment in variables.tf."
+      }
+    },
+
+    "storageAccountName": {
+      "type": "string",
+      "defaultValue": "[concat('stterraformstate', take(uniqueString(subscription().subscriptionId), 8))]",
+      "minLength": 3,
+      "maxLength": 24,
+      "metadata": {
+        "description": "Globally unique storage account name. Default derives a deterministic 24-char name (stterraformstate + 8-char subscription hash) — matches the stterraformstate<unique> convention in backend.tf. Safe for idempotent re-deployments."
+      }
+    },
+
+    "resourceGroupName": {
+      "type": "string",
+      "defaultValue": "rg-terraform-state",
+      "metadata": {
+        "description": "Name of the resource group that will hold all Terraform state resources. Matches resource_group_name in backend.tf."
+      }
+    },
+
+    "stateContainers": {
+      "type": "array",
+      "defaultValue": ["tfstate"],
+      "metadata": {
+        "description": "Blob container names. Defaults to a single 'tfstate' container — matching container_name in backend.tf. Environments are separated by blob key prefix: dev/terraform.tfstate, staging/terraform.tfstate, prod/terraform.tfstate."
+      }
+    },
+
+    "allowedIpRanges": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "IPv4 CIDRs allowed through network ACLs (e.g. [\"203.0.113.0/24\"]). Empty array = 'AzureServices' bypass only; all public internet is denied. Recommended: restrict to pipeline runner IPs + developer egress."
+      }
+    },
+
+    "allowedVnetSubnetIds": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Resource IDs of VNet subnets granted access via service endpoints. Microsoft.Storage must be enabled on each subnet — ManagementSubnet (10.0.3.0/24) in the hub VNet already has this configured in variables.tf. Prod example: /subscriptions/<sub>/resourceGroups/rg-networking-prod-eastus2/providers/Microsoft.Network/virtualNetworks/vnet-hub-prod-eastus2/subnets/ManagementSubnet"
+      }
+    },
+
+    "pipelineIdentityObjectId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Object ID of the service principal or managed identity used by CI/CD pipelines. Receives 'Storage Blob Data Contributor' role scoped to the storage account. Leave empty to skip role assignment."
+      }
+    },
+
+    "enableDefenderForStorage": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Enable Microsoft Defender for Storage (malware scanning, sensitive data threat detection). Priced per-storage-account (~$10/month). Recommended for prod state storage."
+      }
+    },
+
+    "enableResourceLock": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Apply 'CanNotDelete' management lock to the storage account. Prevents accidental deletion of Terraform state. Requires Owner or User Access Administrator to override."
+      }
+    },
+
+    "logAnalyticsWorkspaceId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Full resource ID of an existing Log Analytics workspace for diagnostic settings (storage read/write/delete metrics + blob audit logs). Leave empty to skip diagnostics."
+      }
+    },
+
+    "blobSoftDeleteRetentionDays": {
+      "type": "int",
+      "defaultValue": 90,
+      "minValue": 1,
+      "maxValue": 365,
+      "metadata": {
+        "description": "Soft-delete retention period for blobs (individual state files). Deleted blobs are recoverable within this window."
+      }
+    },
+
+    "containerSoftDeleteRetentionDays": {
+      "type": "int",
+      "defaultValue": 30,
+      "minValue": 1,
+      "maxValue": 365,
+      "metadata": {
+        "description": "Soft-delete retention period for containers. Provides a recovery window if a container is accidentally deleted."
+      }
+    },
+
+    "tags": {
+      "type": "object",
+      "defaultValue": {
+        "environment":         "dev",
+        "cost-center":         "infrastructure",
+        "owner":               "platform-team",
+        "data-classification": "internal",
+        "managed-by":          "arm-bootstrap",
+        "project":             "azure-enterprise-landing-zone"
+      },
+      "metadata": {
+        "description": "Tags applied to the resource group and all state resources. Keys match var.tags in variables.tf. 'managed-by' is set to 'arm-bootstrap' (not 'terraform') to distinguish these prerequisite resources from Terraform-managed infrastructure. Override the 'environment' and 'data-classification' values per environment."
+      }
+    }
+  },
+
+  "variables": {
+    "deployRoleAssignment": "[not(empty(parameters('pipelineIdentityObjectId')))]",
+    "deployDiagnostics": "[not(empty(parameters('logAnalyticsWorkspaceId')))]",
+
+    "networkDefaultAction": "[if(and(empty(parameters('allowedIpRanges')), empty(parameters('allowedVnetSubnetIds'))), 'Allow', 'Deny')]",
+
+    "storageBlobDataContributorRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')]",
+
+    "roleAssignmentName": "[guid(parameters('storageAccountName'), parameters('pipelineIdentityObjectId'), 'StorageBlobDataContributor')]",
+
+    "diagnosticsName": "tfstate-diagnostics",
+
+    "copy": [
+      {
+        "name": "ipRules",
+        "count": "[length(parameters('allowedIpRanges'))]",
+        "input": {
+          "value": "[parameters('allowedIpRanges')[copyIndex('ipRules')]]",
+          "action": "Allow"
+        }
+      },
+      {
+        "name": "virtualNetworkRules",
+        "count": "[length(parameters('allowedVnetSubnetIds'))]",
+        "input": {
+          "id": "[parameters('allowedVnetSubnetIds')[copyIndex('virtualNetworkRules')]]",
+          "action": "Allow"
+        }
+      }
+    ]
+  },
+
+  "resources": [
+    {
+      "type": "Microsoft.Resources/resourceGroups",
+      "apiVersion": "2022-09-01",
+      "name": "[parameters('resourceGroupName')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]"
+    },
+
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2022-09-01",
+      "name": "tfstate-storage-deployment",
+      "resourceGroup": "[parameters('resourceGroupName')]",
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('resourceGroupName'))]"
+      ],
+      "properties": {
+        "mode": "Incremental",
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "parameters": {
+          "location":                        { "value": "[parameters('location')]" },
+          "storageAccountName":              { "value": "[parameters('storageAccountName')]" },
+          "stateContainers":                 { "value": "[parameters('stateContainers')]" },
+          "ipRules":                         { "value": "[variables('ipRules')]" },
+          "virtualNetworkRules":             { "value": "[variables('virtualNetworkRules')]" },
+          "networkDefaultAction":            { "value": "[variables('networkDefaultAction')]" },
+          "pipelineIdentityObjectId":        { "value": "[parameters('pipelineIdentityObjectId')]" },
+          "deployRoleAssignment":            { "value": "[variables('deployRoleAssignment')]" },
+          "roleAssignmentName":              { "value": "[variables('roleAssignmentName')]" },
+          "storageBlobDataContributorRoleId": { "value": "[variables('storageBlobDataContributorRoleId')]" },
+          "enableDefenderForStorage":        { "value": "[parameters('enableDefenderForStorage')]" },
+          "enableResourceLock":              { "value": "[parameters('enableResourceLock')]" },
+          "deployDiagnostics":               { "value": "[variables('deployDiagnostics')]" },
+          "logAnalyticsWorkspaceId":         { "value": "[parameters('logAnalyticsWorkspaceId')]" },
+          "diagnosticsName":                 { "value": "[variables('diagnosticsName')]" },
+          "blobSoftDeleteRetentionDays":     { "value": "[parameters('blobSoftDeleteRetentionDays')]" },
+          "containerSoftDeleteRetentionDays":{ "value": "[parameters('containerSoftDeleteRetentionDays')]" },
+          "tags":                            { "value": "[parameters('tags')]" }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "location":                         { "type": "string" },
+            "storageAccountName":               { "type": "string" },
+            "stateContainers":                  { "type": "array" },
+            "ipRules":                          { "type": "array" },
+            "virtualNetworkRules":              { "type": "array" },
+            "networkDefaultAction":             { "type": "string" },
+            "pipelineIdentityObjectId":         { "type": "string" },
+            "deployRoleAssignment":             { "type": "bool" },
+            "roleAssignmentName":               { "type": "string" },
+            "storageBlobDataContributorRoleId": { "type": "string" },
+            "enableDefenderForStorage":         { "type": "bool" },
+            "enableResourceLock":               { "type": "bool" },
+            "deployDiagnostics":                { "type": "bool" },
+            "logAnalyticsWorkspaceId":          { "type": "string" },
+            "diagnosticsName":                  { "type": "string" },
+            "blobSoftDeleteRetentionDays":      { "type": "int" },
+            "containerSoftDeleteRetentionDays": { "type": "int" },
+            "tags":                             { "type": "object" }
+          },
+
+          "variables": {
+            "storageAccountId": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+          },
+
+          "resources": [
+
+            {
+              "type": "Microsoft.Storage/storageAccounts",
+              "apiVersion": "2023-01-01",
+              "name": "[parameters('storageAccountName')]",
+              "location": "[parameters('location')]",
+              "tags": "[parameters('tags')]",
+              "kind": "StorageV2",
+              "sku": {
+                "name": "Standard_GRS"
+              },
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {
+                "accessTier": "Hot",
+                "supportsHttpsTrafficOnly": true,
+                "minimumTlsVersion": "TLS1_2",
+                "allowBlobPublicAccess": false,
+                "allowSharedKeyAccess": true,
+                "allowCrossTenantReplication": false,
+                "defaultToOAuthAuthentication": false,
+                "publicNetworkAccess": "[if(equals(parameters('networkDefaultAction'), 'Deny'), 'Enabled', 'Enabled')]",
+                "encryption": {
+                  "services": {
+                    "blob": { "enabled": true, "keyType": "Account" },
+                    "file": { "enabled": true, "keyType": "Account" },
+                    "queue": { "enabled": true, "keyType": "Account" },
+                    "table": { "enabled": true, "keyType": "Account" }
+                  },
+                  "keySource": "Microsoft.Storage",
+                  "requireInfrastructureEncryption": true
+                },
+                "networkAcls": {
+                  "defaultAction": "[parameters('networkDefaultAction')]",
+                  "bypass": "AzureServices",
+                  "ipRules": "[parameters('ipRules')]",
+                  "virtualNetworkRules": "[parameters('virtualNetworkRules')]"
+                },
+                "sasPolicy": {
+                  "sasExpirationPeriod": "00.01:00:00",
+                  "expirationAction": "Log"
+                },
+                "keyPolicy": {
+                  "keyExpirationPeriodInDays": 90
+                }
+              }
+            },
+
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices",
+              "apiVersion": "2023-01-01",
+              "name": "[concat(parameters('storageAccountName'), '/default')]",
+              "dependsOn": [
+                "[variables('storageAccountId')]"
+              ],
+              "properties": {
+                "isVersioningEnabled": true,
+                "changeFeed": {
+                  "enabled": true,
+                  "retentionInDays": 30
+                },
+                "restorePolicy": {
+                  "enabled": true,
+                  "days": 29
+                },
+                "deleteRetentionPolicy": {
+                  "enabled": true,
+                  "days": "[parameters('blobSoftDeleteRetentionDays')]",
+                  "allowPermanentDelete": false
+                },
+                "containerDeleteRetentionPolicy": {
+                  "enabled": true,
+                  "days": "[parameters('containerSoftDeleteRetentionDays')]"
+                },
+                "cors": {
+                  "corsRules": []
+                }
+              }
+            },
+
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+              "apiVersion": "2023-01-01",
+              "copy": {
+                "name": "containerCopy",
+                "count": "[length(parameters('stateContainers'))]",
+                "mode": "Parallel"
+              },
+              "name": "[concat(parameters('storageAccountName'), '/default/', parameters('stateContainers')[copyIndex()])]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices', parameters('storageAccountName'), 'default')]"
+              ],
+              "properties": {
+                "publicAccess": "None",
+                "metadata": {
+                  "purpose":    "terraform-state",
+                  "key-prefix": "'{env}/terraform.tfstate' — environment set at terraform init time via -backend-config"
+                }
+              }
+            },
+
+            {
+              "type": "Microsoft.Security/advancedThreatProtectionSettings",
+              "apiVersion": "2019-01-01",
+              "condition": "[parameters('enableDefenderForStorage')]",
+              "name": "[concat(parameters('storageAccountName'), '/current')]",
+              "dependsOn": [
+                "[variables('storageAccountId')]"
+              ],
+              "properties": {
+                "isEnabled": true
+              }
+            },
+
+            {
+              "type": "Microsoft.Authorization/locks",
+              "apiVersion": "2020-05-01",
+              "condition": "[parameters('enableResourceLock')]",
+              "scope": "[concat('Microsoft.Storage/storageAccounts/', parameters('storageAccountName'))]",
+              "name": "[concat(parameters('storageAccountName'), '-lock')]",
+              "dependsOn": [
+                "[variables('storageAccountId')]"
+              ],
+              "properties": {
+                "level": "CanNotDelete",
+                "notes": "Terraform state storage — deletion would destroy infrastructure state. Remove lock explicitly before decommissioning."
+              }
+            },
+
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "condition": "[parameters('deployRoleAssignment')]",
+              "scope": "[concat('Microsoft.Storage/storageAccounts/', parameters('storageAccountName'))]",
+              "name": "[parameters('roleAssignmentName')]",
+              "dependsOn": [
+                "[variables('storageAccountId')]"
+              ],
+              "properties": {
+                "roleDefinitionId": "[parameters('storageBlobDataContributorRoleId')]",
+                "principalId": "[parameters('pipelineIdentityObjectId')]",
+                "principalType": "ServicePrincipal",
+                "description": "Allows CI/CD pipeline identity to read/write/delete Terraform state blobs."
+              }
+            },
+
+            {
+              "type": "Microsoft.Insights/diagnosticSettings",
+              "apiVersion": "2021-05-01-preview",
+              "condition": "[parameters('deployDiagnostics')]",
+              "scope": "[concat('Microsoft.Storage/storageAccounts/', parameters('storageAccountName'), '/blobServices/default')]",
+              "name": "[parameters('diagnosticsName')]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices', parameters('storageAccountName'), 'default')]"
+              ],
+              "properties": {
+                "workspaceId": "[parameters('logAnalyticsWorkspaceId')]",
+                "logs": [
+                  {
+                    "category": "StorageRead",
+                    "enabled": true,
+                    "retentionPolicy": { "enabled": false, "days": 0 }
+                  },
+                  {
+                    "category": "StorageWrite",
+                    "enabled": true,
+                    "retentionPolicy": { "enabled": false, "days": 0 }
+                  },
+                  {
+                    "category": "StorageDelete",
+                    "enabled": true,
+                    "retentionPolicy": { "enabled": false, "days": 0 }
+                  }
+                ],
+                "metrics": [
+                  {
+                    "category": "Transaction",
+                    "enabled": true,
+                    "retentionPolicy": { "enabled": false, "days": 0 }
+                  }
+                ]
+              }
+            }
+
+          ],
+
+          "outputs": {
+            "storageAccountName": {
+              "type": "string",
+              "value": "[parameters('storageAccountName')]"
+            },
+            "storageAccountId": {
+              "type": "string",
+              "value": "[variables('storageAccountId')]"
+            },
+            "primaryEndpointBlob": {
+              "type": "string",
+              "value": "[reference(variables('storageAccountId'), '2023-01-01').primaryEndpoints.blob]"
+            },
+            "systemAssignedPrincipalId": {
+              "type": "string",
+              "value": "[reference(variables('storageAccountId'), '2023-01-01', 'full').identity.principalId]"
+            },
+            "containers": {
+              "type": "array",
+              "copy": {
+                "count": "[length(parameters('stateContainers'))]",
+                "input": "[parameters('stateContainers')[copyIndex()]]"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+
+  "outputs": {
+    "resourceGroupName": {
+      "type": "string",
+      "value": "[parameters('resourceGroupName')]"
+    },
+    "storageAccountName": {
+      "type": "string",
+      "value": "[reference('tfstate-storage-deployment').outputs.storageAccountName.value]"
+    },
+    "storageAccountId": {
+      "type": "string",
+      "value": "[reference('tfstate-storage-deployment').outputs.storageAccountId.value]"
+    },
+    "primaryEndpointBlob": {
+      "type": "string",
+      "value": "[reference('tfstate-storage-deployment').outputs.primaryEndpointBlob.value]"
+    },
+    "systemAssignedPrincipalId": {
+      "type": "string",
+      "value": "[reference('tfstate-storage-deployment').outputs.systemAssignedPrincipalId.value]"
+    },
+    "backendConfig": {
+      "type": "object",
+      "value": {
+        "resource_group_name":  "[parameters('resourceGroupName')]",
+        "storage_account_name": "[reference('tfstate-storage-deployment').outputs.storageAccountName.value]",
+        "container_name":       "tfstate",
+        "key":                  "[concat(parameters('environment'), '/terraform.tfstate')]"
+      }
+    }
+  }
+}
